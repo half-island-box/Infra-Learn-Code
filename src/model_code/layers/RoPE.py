@@ -28,6 +28,7 @@ class RotaryEmbedding(nn.Module):
         # 注册到buffer
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
+
     def forward(
         self, positions:torch.Tensor, query:torch.Tensor, key:torch.Tensor
     )-> tuple[torch.Tensor, torch.Tensor]:
@@ -61,6 +62,4 @@ class RotaryEmbedding(nn.Module):
 
         return _apply(query), _apply(key)
 
-
-if __name__ =="__main__":
     

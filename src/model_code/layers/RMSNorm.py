@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 
-class RMSNorm(nn.Module):
+class RMSNorm_mix(nn.Module):
     def __init__(self, hidden_size:int, eps:float=1e-6):
         super().__init__()
 
@@ -27,6 +27,25 @@ class RMSNorm(nn.Module):
         out=out32.to(original_dtype)
 
         return (out, residual) if residual is not None else out
+
+class RMSNorm(nn.Module):
+    def __init__(self, hidden_size:int, eps:float=1e-6):
+        super().__init__()
+
+        self.weight=nn.Parameter(torch.ones(hidden_size))
+        self.eps=eps
+
+
+    def forward(self, x:torch.Tensor, )-> torch.Tensor:
+        ori_dtype=x.dtype
+
+        x32=x.float()
+
+        rms=torch.rsqrt(x32.pow(2).mean(dim=-1, keepdim=True)+self.eps)
+        x_normed=x32*rms
+        out32=x_normed*self.weight.float()
+
+        return out32.to(ori_dtype)
 
 
 if __name__ =="__main__":
