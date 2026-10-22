@@ -6,6 +6,7 @@ from pathlib import Path
 # sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import os
+import wandb
 import datetime
 import torch
 import torch.nn.functional as F
@@ -15,10 +16,20 @@ from torch.optim import AdamW
 from transformers import AutoConfig
 
 from model_code.models.llama import Llama
-from utils import set_all_seed, print
+from model_code.utils import set_all_seed, print
+
+import model_code.parallel.process_group_manager as pgm
+from model_code.parallel.process_group_manager import setup_process_group_manager
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Training script for Llama Model")
+
+    # 分布式训练参数
+    parser.add_argument("--tp_size", type=int, default=1, help="Tensor Parallel size")
+    parser.add_argument("--dp_size", type=int, default=1, help="Data Parallel size")
+    parser.add_argument("--pp_size", type=int, default=1, help="Pipeline Parallel size")
+    parser.add_argument("--pp_engine", type=str, default="afab", choices=["1f1b", "afab"]) #pp的优化方式
+ 
 
     # 环境参数
     parser.add_argument("--omp_num_threads", type=str, default="1") #OpenMP线程数 1 避免多进程抢CPU
@@ -67,9 +78,25 @@ if __name__ == "__main__":
         backend=backend, 
         init_method=f"env://", 
         timeout=datetime.timedelta(minutes=2))
+    setup_process_group_manager(dp_size=args.dp_size, pp_size=args.pp_size, tp_size=args.tp_size)
 
-
+    is_wandb_rank = pgm.process_group_manager.tp_rank == 0 and pgm.process_group_manager.dp_rank ==0 and pgm.process_group_manager.pp_is_last_stage
     set_all_seed(args.seed)
+
+    if is_wandb_rank and args.use_wandb:
+        wandb.init(
+            project="learn_dist_train",
+            name=f"{args.run_name}_{pgm.process_group_manager}",
+            config={
+                "tensor_parallel_size": pgm.process_group_manager.tp_world_size,
+                "pipeline_parallel_size": pgm.process_group_manager.pp_world_size,
+                "data_parallel_size": pgm.process_group_manager.dp_world_size,
+                "model": args.model_name,
+                "learning_rate": args.learning_rate,
+                "seed": args.seed,
+            },
+        )
+        
     # 设置模型
     model_config = AutoConfig.from_pretrained(args.model_name)
     model_config.num_hidden_layers = args.num_hidden_layers
@@ -102,5 +129,11 @@ if __name__ == "__main__":
 
     optimizer.step()
 
-    print(f"Loss: {loss.item():.4f}", is_print_rank=(global_rank == 0))
+    print(f"[rank {pgm.process_group_manager.global_rank}], Loss: {loss:.4f}")
+       
+    if is_wandb_rank and args.use_wandb:
+        wandb.log({"loss": loss.item()})
+
+    if is_wandb_rank and args.use_wandb:
+        wandb.finish()
     dist.destroy_process_group()
