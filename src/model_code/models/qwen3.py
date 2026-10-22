@@ -86,15 +86,15 @@ class Qwen3DecoderLayer(nn.Module):
                     residual:torch.Tensor | None, rotary_emb: RoPE
                     ) -> tuple[torch.Tensor, torch.Tensor | None]:
 
-            if residual is None:
-                residual = hidden_state
-                hidden_state = self.input_layernorm(hidden_state)
-            else:
-                hidden_state, residual = self.input_layernorm(hidden_state, residual)
+        if residual is None:
+            residual = hidden_state
+            hidden_state = self.input_layernorm(hidden_state)
+        else:
+            hidden_state, residual = self.input_layernorm(hidden_state, residual)
 
-            hidden_state = self.self_attn(hidden_state, positions, rotary_emb)
-            hidden_state, residual = self.post_layernorm(hidden_state, residual)
-            return self.mlp(hidden_state), residual
+        hidden_state = self.self_attn(hidden_state, positions, rotary_emb)
+        hidden_state, residual = self.post_layernorm(hidden_state, residual)
+        return self.mlp(hidden_state), residual
 
 
 class Qwen3Model(nn.Module):
