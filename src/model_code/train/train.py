@@ -6,6 +6,7 @@ from pathlib import Path
 # sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import os
+import time
 import wandb
 import datetime
 import torch
@@ -15,14 +16,43 @@ import argparse
 from torch.optim import AdamW
 from transformers import AutoConfig
 
+import lovely_tensors as lt; lt.monkey_patch()
 from model_code.models.llama import Llama
-from model_code.utils import set_all_seed, print
+from model_code.utils import set_all_seed, print, to_readable_format
+from model_code.dataloader import MicroBatchDataLoader
+
+def train_step(model, dataloader, device):
+    acc_loss = 0.0
+
+    for i in range(dataloader.grad_acc_steps):
+        batch = next(dataloader)
+        input_ids = batch["input_ids"].to(device)
+        target_ids = batch["target_ids"].to(device)
+
+        outputs = model(input_ids=input_ids)
+
+        batch_size, seq_len = input_ids.shape
+        target_ids = target_ids.reshape(-1)
+        outputs = outputs.view(seq_len*batch_size, -1)
+        loss= F.cross_entropy(outputs, target_ids, reduction='mean') / dataloader.grad_acc_steps
+
+        loss.backward()
+
+        acc_loss += loss.item()
+
+    return acc_loss
+
 
 import model_code.parallel.process_group_manager as pgm
 from model_code.parallel.process_group_manager import setup_process_group_manager
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Training script for Llama Model")
+
+    # 数据集参数
+    parser.add_argument("--dataset_name", type=str, default="roneneldan/TinyStories")
+    parser.add_argument("--num_workers", type=int, default=1)
+    parser.add_argument("--num_proc", type=int, default=4)
 
     # 分布式训练参数
     parser.add_argument("--tp_size", type=int, default=1, help="Tensor Parallel size")
@@ -46,6 +76,8 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=3e-4) # AdamW的学习率
     parser.add_argument("--seq_len", type=int, default=32) #最大序列长度
     parser.add_argument("--micro_batch_size", type=int, default=1) # 单卡单步的batch_size
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1) # 梯度累积步数
+    parser.add_argument("--max_tokens", type=int, default=1e6)
 
     # 日志参数
     parser.add_argument("--run_name", type=str, default="default_run")
@@ -114,25 +146,50 @@ if __name__ == "__main__":
 
     dist.barrier()
 
-    input_ids = torch.randint(0, model_config.vocab_size, (args.micro_batch_size, args.seq_len), device=device)
-    target_ids = torch.randint(0, model_config.vocab_size, (args.micro_batch_size, args.seq_len), device=device)
+    dataloader = MicroBatchDataLoader(
+        seq_len=args.seq_len,
+        micro_batch_size=args.micro_batch_size,
+        grad_acc_steps=args.gradient_accumulation_steps,
+        dataset_name=args.dataset_name,
+        tokenizer_name=args.model_name,
+        max_tokens=args.max_tokens,
+        num_workers=args.num_workers,
+        num_proc=args.num_proc,
+    )
 
-    optimizer.zero_grad()
+    tokens_per_step = dataloader.global_batch_size * args.seq_len
+    if pgm.process_group_manager.global_rank == 0:
+        print("Tokens per step:", to_readable_format(tokens_per_step), is_print_rank=is_wandb_rank)
+ 
+    trained_token, step = 0, 0
 
-    outputs = model(input_ids=input_ids)
+    dist.barrier()
 
-    target_ids = target_ids.reshape(-1)
-    outputs = outputs.view(-1, model_config.vocab_size)
-    loss = F.cross_entropy(outputs, target_ids)
+    while trained_token<args.max_tokens:
+        step_start_time = time.time()
+        optimizer.zero_grad()
 
-    loss.backward()
+        loss = train_step(model, dataloader, device)
 
-    optimizer.step()
+        optimizer.step()
 
-    print(f"[rank {pgm.process_group_manager.global_rank}], Loss: {loss:.4f}")
-       
-    if is_wandb_rank and args.use_wandb:
-        wandb.log({"loss": loss.item()})
+        step_duration = time.time() - step_start_time
+        trained_token += tokens_per_step
+        step+=1
+
+        print(f"[rank {pgm.process_group_manager.global_rank}] Step: {step}, Loss: {loss:.4f}, "
+            f"Global batch size (with seq_len): {to_readable_format(tokens_per_step)}, "
+            f"Tokens/s: {to_readable_format(tokens_per_step / step_duration)}, "
+            f"Tokens/s/GPU: {to_readable_format(tokens_per_step / step_duration / world_size)}, "
+            f"Tokens: {to_readable_format(trained_token)}{('/' + to_readable_format(args.max_tokens))}, "
+            f"Memory usage: {torch.cuda.memory_reserved() / 1e9:.2f}GB"
+            , is_print_rank=is_wandb_rank
+        )   
+
+        if is_wandb_rank and args.use_wandb:
+            wandb.log({"loss": loss, "tokens_per_step": tokens_per_step, "tokens_per_second": tokens_per_step / step_duration,\
+                "memory_usage": torch.cuda.memory_reserved() / 1e9, "trained_tokens": tokens_per_step})
+                  
 
     if is_wandb_rank and args.use_wandb:
         wandb.finish()
