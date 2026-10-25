@@ -10,6 +10,7 @@ from model_code.layers.Attention import Attention
 from model_code.layers.RoPE import RotaryEmbedding as RoPE
 from model_code.layers.RMSNorm import RMSNorm_mix as RMSNorm
 from model_code.layers.Activation import SiluAndMul as Activation
+import model_code.parallel.process_group_manager as pgm
 
 class _TideLinear(nn.Module):
     def __init__(self, weightL: torch.Tensor):
@@ -39,36 +40,39 @@ class Qwen3Attention(nn.Module):
     def __init__(self, config:Qwen3Config):
         super().__init__()
 
+        # 投影层按全局头数定义，apply_tensor_parallel 会把它们切分到各 rank 的本地头数
+        tp_size = pgm.process_group_manager.tp_world_size
+        assert config.num_attention_heads % tp_size == 0, "num_attention_heads should be divisible by tp world size"
+        assert config.num_key_value_heads % tp_size == 0, "num_key_value_heads should be divisible by tp world size"
+
         self.num_heads = config.num_attention_heads
-        self.num_kv_heads=config.num_key_value_heads
+        self.num_kv_heads = config.num_key_value_heads
+        # TP 切分后每个 rank 本地持有的头数（TP=1 时等于全局头数）
+        self.num_local_heads = self.num_heads // tp_size
+        self.num_local_kv_heads = self.num_kv_heads // tp_size
 
         self.head_dim = config.head_dim
 
-        self.q_size = self.num_heads * self.head_dim 
-        self.kv_size= self.num_kv_heads * self.head_dim
+        self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=False)
 
-        self.qkv_proj = nn.Linear(config.hidden_size, self.q_size+2*self.kv_size, bias=False)
-        self.o_proj = nn.Linear(self.q_size, config.hidden_size, bias=False)
+        self.attn = Attention(self.num_local_heads, self.head_dim, self.num_local_kv_heads)
 
-        self.attn=Attention(self.num_heads, self.head_dim, self.num_kv_heads)
-
-        self.q_norm=RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm=RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
     def forward(self, x:torch.Tensor, positions: torch.Tensor, rotary_embedding: RoPE) -> torch.Tensor:
-        q, k, v = self.qkv_proj(x).split(
-            [self.q_size, self.kv_size, self.kv_size], dim=-1
-        )
+        # 切分后各投影输出本地头数，所以 unflatten 用本地头数
+        q = self.q_norm(self.q_proj(x).unflatten(-1, (self.num_local_heads, self.head_dim)))
+        k = self.k_norm(self.k_proj(x).unflatten(-1, (self.num_local_kv_heads, self.head_dim)))
+        v = self.v_proj(x).unflatten(-1, (self.num_local_kv_heads, self.head_dim))
 
-        # [B, S, H*D] -> [B, S, H, D]
-        q=self.q_norm(q.unflatten(-1, (self.num_heads, self.head_dim)))
-        k=self.k_norm(k.unflatten(-1, (self.num_kv_heads, self.head_dim)))
-        v=v.unflatten(-1, (self.num_kv_heads, self.head_dim))
-
-        q,k= rotary_embedding(positions, q, k)
+        q, k = rotary_embedding(positions, q, k)
 
         # [B, S, H, D] -> [B, S, H*D]
-        return self.o_proj(self.attn(q,k,v).flatten(-2))
+        return self.o_proj(self.attn(q, k, v).flatten(-2))
 
 
 class Qwen3DecoderLayer(nn.Module):

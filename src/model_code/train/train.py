@@ -20,6 +20,7 @@ import lovely_tensors as lt; lt.monkey_patch()
 from model_code.models.llama import Llama
 from model_code.utils import set_all_seed, print, to_readable_format
 from model_code.dataloader import MicroBatchDataLoader
+from model_code.parallel.tensor_parallel import apply_tensor_parallel
 
 def train_step(model, dataloader, device):
     acc_loss = 0.0
@@ -137,6 +138,11 @@ if __name__ == "__main__":
     model_config.max_position_embeddings = args.seq_len
 
     model = Llama(config=model_config)
+    # model.to(dtype).to(device)
+
+    if pgm.process_group_manager.tp_world_size > 1:
+        model = apply_tensor_parallel(model)
+
     model.to(dtype).to(device)
     model.train()
 

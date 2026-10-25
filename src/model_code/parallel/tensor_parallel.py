@@ -7,11 +7,11 @@ import torch.nn.functional as F
 import model_code.parallel.process_group_manager as pgm
 
 # 将一个tensor的最后一个维度，按照分区数量平均切分
-def splite_tensor_along_last_dim(tensor, num_partitions):
+def split_tensor_along_last_dim(tensor, num_partitions):
     last_dim = tensor.dim() - 1
     assert tensor.size()[last_dim] % num_partitions == 0, f"{tensor.size()[last_dim]} is not divisible by {num_partitions}"
     last_dim_size = tensor.size()[last_dim] // num_partitions
-    return torch.splite(tensor, last_dim_size, dim=last_dim)
+    return torch.split(tensor, last_dim_size, dim=last_dim)
 
 # all reduce求和 用于按行切分的合并
 class Reduce(torch.autograd.Function):
@@ -49,7 +49,7 @@ class Gather(torch.autograd.Function):
         if pgm.process_group_manager.tp_world_size == 1:
             return grad_output
 
-        chunks = splite_tensor_along_last_dim(grad_output, pgm.process_group_manager.tp_world_size)
+        chunks = split_tensor_along_last_dim(grad_output, pgm.process_group_manager.tp_world_size)
         return chunks[pgm.process_group_manager.tp_rank].contiguous()
 
 
@@ -68,7 +68,7 @@ class Copy(torch.autograd.Function):
 
 # 权重矩阵按列切分：接收维度不变，输出维度均分
 class ColumnParallelLinear(nn.Module):
-    def __init__(self, in_features, int, out_features:int, bias: bool, gather_ouptut: bool = False):
+    def __init__(self, in_features: int, out_features: int, bias: bool, gather_output: bool = False):
         super(ColumnParallelLinear, self).__init__()
 
         self.tp_world_size = pgm.process_group_manager.tp_world_size
@@ -79,7 +79,7 @@ class ColumnParallelLinear(nn.Module):
 
         assert out_features % self.tp_world_size == 0, "Hidden dim must be divisible by the tp world size"
         self.output_size_per_partition = out_features // self.tp_world_size
-        self.gather_output = gather_ouptut
+        self.gather_output = gather_output
 
         # Note: torch.nn.functional.linear performs XW^T + b so we exchange the order of dimensions
         self.weight = nn.Parameter(torch.Tensor(self.output_size_per_partition, self.in_features))
@@ -268,7 +268,7 @@ def apply_tensor_parallel(model):
                 in_features=linear_layer.in_features,
                 out_features=linear_layer.out_features,
                 bias = linear_layer.bias is not None,
-                gather_ouptut= args.get("gather_output",False) # 默认不聚合，直到final_proj
+                gather_output= args.get("gather_output", False) # 默认不聚合，直到 lm_head
             )
         elif _style == "row":
             new_linear_layer = RowParallelLinear(
@@ -285,21 +285,30 @@ def apply_tensor_parallel(model):
 
     # 规定各种层其中的linear的切分方式
     # 可一般认为输入层按列，输出层按行
+    # 注意：注意力已拆成 q/k/v 三个独立投影，各自按列切分，GQA 下也能正确对齐本地头数
     module_linear_name_stype_mapping_list = [
         ("attention", "q_proj", "column"),
         ("attention", "k_proj", "column"),
         ("attention", "v_proj", "column"),
-        ("attention", "out_proj", "row"),
+        ("attention", "o_proj", "row"),
         ("mlp", "up_proj", "column"),
         ("mlp", "gate_proj", "column"),
-        ("mlp", "down_proj", "row"),        
-    ]    
+        ("mlp", "down_proj", "row"),
+    ]
 
-    for layer in model.decoder_layers:
+    # 模型结构：外层(如 Llama) -> .model(ForCausalLm) -> .model(核心 Model，含 layers/embed_tokens)
+    causal_lm = model.model
+    transformer = causal_lm.model
+
+    for layer in transformer.layers:
         for module_name, linear_proj_name, style in module_linear_name_stype_mapping_list:
             _replace_module(getattr(layer, module_name), linear_proj_name, style)
 
-    _replace_module(model, "embedding", "vocab")
-    _replace_module(model, "final_proj", "column", args={"gather_output": True})
+    _replace_module(transformer, "embed_tokens", "vocab")
+
+    # 词表未绑定时 lm_head 是独立的 nn.Linear，可列切分后 gather 回完整词表；
+    # 绑定时它是 _TideLinear(与 embed_tokens 共享权重)，这里跳过，需要单独处理
+    if isinstance(causal_lm.lm_head, nn.Linear):
+        _replace_module(causal_lm, "lm_head", "column", args={"gather_output": True})
 
     return model
