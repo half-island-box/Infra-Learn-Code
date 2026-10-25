@@ -21,7 +21,7 @@ from model_code.models.llama import Llama
 from model_code.utils import set_all_seed, print, to_readable_format
 from model_code.dataloader import MicroBatchDataLoader
 from model_code.parallel.tensor_parallel import apply_tensor_parallel
-from model_code.parallel.data_parallel import DataParallelNative
+from model_code.parallel.data_parallel import DataParallelBucket
 
 def train_step(model, dataloader, device):
     acc_loss = 0.0
@@ -153,7 +153,7 @@ if __name__ == "__main__":
     model.to(dtype).to(device)
 
     if pgm.process_group_manager.dp_world_size > 1:
-        model = DataParallelNative(model)
+        model = DataParallelBucket(model)
     model.train()
 
     dist.barrier()
