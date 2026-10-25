@@ -1,5 +1,5 @@
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 import numpy as np
 from functools import partial
 from datasets import Features, Sequence, Value, load_dataset
@@ -8,7 +8,7 @@ from transformers import AutoTokenizer
 import model_code.parallel.process_group_manager as pgm
 
 class MicroBatchDataLoader(DataLoader):
-    def __init__(self, seq_len, micro_batch_size, grad_acc_steps, dataset_name, tokenizer_name, max_tokens, num_workers, num_proc, split="train"):
+    def __init__(self, seq_len, micro_batch_size, grad_acc_steps, dataset_name, tokenizer_name, max_tokens, num_workers, num_proc, seed, split="train"):
         self.micro_batch_size = micro_batch_size
         self.grad_acc_steps = grad_acc_steps # 梯度累积
         self.seq_len = seq_len
@@ -27,12 +27,21 @@ class MicroBatchDataLoader(DataLoader):
         total_tokens = self.tokenized_dataset.num_rows * (self.seq_len + 1)
         assert total_tokens >= max_tokens, f"Not enough tokens. Have {total_tokens} tokens but need {max_tokens} tokens"
 
+        self.sampler = DistributedSampler(
+            self.tokenized_dataset,
+            num_replicas=pgm.process_group_manager.dp_world_size,
+            rank=pgm.process_group_manager.dp_rank,
+            seed=seed,
+            shuffle=False
+        )
+
         super().__init__(
             self.tokenized_dataset,
             batch_size=micro_batch_size,
             collate_fn=self.collate_batch,
             pin_memory=True,
             num_workers=num_workers,
+            sampler=self.sampler,
             shuffle=False
         )
 

@@ -21,14 +21,22 @@ from model_code.models.llama import Llama
 from model_code.utils import set_all_seed, print, to_readable_format
 from model_code.dataloader import MicroBatchDataLoader
 from model_code.parallel.tensor_parallel import apply_tensor_parallel
+from model_code.parallel.data_parallel import DataParallelNative
 
 def train_step(model, dataloader, device):
     acc_loss = 0.0
 
+    required_grad_sync = pgm.process_group_manager.dp_world_size > 1
+
+    # 梯度累积
     for i in range(dataloader.grad_acc_steps):
         batch = next(dataloader)
         input_ids = batch["input_ids"].to(device)
         target_ids = batch["target_ids"].to(device)
+
+        # 到达梯度累积的最后一步，再进行梯度的all-reduce
+        if required_grad_sync:
+            model.require_backward_grad_sync = (i == dataloader.grad_acc_steps - 1)
 
         outputs = model(input_ids=input_ids)
 
@@ -138,12 +146,14 @@ if __name__ == "__main__":
     model_config.max_position_embeddings = args.seq_len
 
     model = Llama(config=model_config)
-    # model.to(dtype).to(device)
 
     if pgm.process_group_manager.tp_world_size > 1:
         model = apply_tensor_parallel(model)
 
     model.to(dtype).to(device)
+
+    if pgm.process_group_manager.dp_world_size > 1:
+        model = DataParallelNative(model)
     model.train()
 
     dist.barrier()
@@ -161,6 +171,7 @@ if __name__ == "__main__":
         max_tokens=args.max_tokens,
         num_workers=args.num_workers,
         num_proc=args.num_proc,
+        seed=args.seed
     )
 
     tokens_per_step = dataloader.global_batch_size * args.seq_len
@@ -182,6 +193,10 @@ if __name__ == "__main__":
         step_duration = time.time() - step_start_time
         trained_token += tokens_per_step
         step+=1
+
+        # DDP实现，需要reset梯度缓存
+        if hasattr(model, 'reset'):
+            model.reset()
 
         print(f"[rank {pgm.process_group_manager.global_rank}] Step: {step}, Loss: {loss:.4f}, "
             f"Global batch size (with seq_len): {to_readable_format(tokens_per_step)}, "
