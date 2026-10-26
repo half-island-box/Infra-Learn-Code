@@ -22,7 +22,7 @@ from model_code.utils import set_all_seed, print, to_readable_format
 from model_code.dataloader import MicroBatchDataLoader
 from model_code.parallel.tensor_parallel import apply_tensor_parallel
 from model_code.parallel.data_parallel import DataParallelBucket
-from model_code.parallel.pipeline_parallel import PipelineParallel, train_step_pipeline_afab
+from model_code.parallel.pipeline_parallel import PipelineParallel, train_step_pipeline_afab, train_step_pipeline_1f1b
 
 # 对PP最后一层的DP通信组，组内作梯度平均
 def all_reduce_loss_across_dp_ranks(loss, device):
@@ -205,6 +205,8 @@ if __name__ == "__main__":
         if pgm.process_group_manager.pp_world_size > 1:
             if args.pp_engine = "afab":
                 loss = train_step_pipeline_afab(model, dataloader, tensor_shapes, device, dtype)
+            elif args.pp_engine == '1f1b':
+                loss = train_step_pipeline_1f1b(model, dataloader, tensor_shapes, device, dtype)
             else:
                 raise ValueError(f"Invalid pipeline, parallel, engine: {args.pp_engine}")
 

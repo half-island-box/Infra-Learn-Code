@@ -49,6 +49,37 @@ def pipeline_communication(operarion, device, dtype, tensor=None, shapes=None):
 
     return tensor if not is_send else None
 
+def bidirectional_pipeline_communication(operation, send_tensor, recv_shapes, device, dtype):
+    global STEP
+    global VERBOSE
+
+    is_fwd = (operation == 'send_fwd_recv_bwd')
+
+    if (is_fwd and pgm.process_group_manager.pp_is_last_stage) or \
+    (not is_fwd and pgm.process_group_manager.pp_is_first_stage):
+        return None
+
+    peer_rank = pgm.process_group_manager.pp_next_rank if is_fwd else pgm.process_group_manager.pp_prev_rank
+
+    recv_tensor = torch.empty(recv_shapes, requires_grad=True, device=device, dtype=dtype)
+
+    reqs = dist.batch_isend_irecv([
+        dist.P2POp(dist.isend, send_tensor, peer_rank),
+        dist.P2POp(dist.irecv, recv_tensor, peer_rank)
+    ])
+
+    if VERBOSE:
+        print(f"{operation} | sending {'next' if is_fwd else 'prev'} "
+              f"{pgm.process_group_manager.pp_rank} -> {peer_rank} | "
+              f"receiving {'next' if is_fwd else 'prev'} {peer_rank} -> "
+              f"{pgm.process_group_manager.pp_rank} | STEP {STEP=} | "
+              f"RANK:{pgm.process_group_manager.pp_rank}", flush=True)
+
+    [req.wait() for req in reqs]
+    torch.cuda.synchronize()
+
+    if VERBOSE: STEP += 1
+    return recv_tensor
 
 class PipelineParallel(nn.Module):
     def __init__(self, model, config):
@@ -117,6 +148,73 @@ def train_step_pipeline_afab(model, data_loader, tensor_shapes, device, dtype):
 
         output_tensor_grad = pipeline_communication(operarion='recv_backward', shapes=tensor_shapes, device=device, dtype=dtype)
         intut_tensor, output_tensor = input_tensors.pop(0), output_tensors.pop(0)
+        input_tensor_grad = model.backward(input_tensor, output_tensor, output_tensor_grad)
+        pipeline_communication(operarion='send_backward', tensor=input_tensor_grad, device=device, dtype=dtype)
+
+    return logging_loss
+
+# 1f1b：one-forward-one-backward，某个micro batch完成前向则立即计算backward，
+# 以释放对应的梯度空间，降低显存压力
+def train_step_pipeline_1f1b(model, data_loader, tensor_shapes, device, dtype):
+    # 本GPU需要warm up的轮数 = pp成员数 - 本GPU rank -1
+    num_warmup_microbatches = min(pgm.process_group_manager.pp_world_size - pgm.process_group_manager.pp_rank - 1, data_loader.grad_acc_steps)
+    num_microbatches_remaining = data_loader.grad_acc_steps - num_warmup_microbatches
+    logging_loss, input_tensors, output_tensors = 0.0, [], []
+    required_grad_sync = pgm.process_group_manager.dp_world_size > 1
+
+    def _forward_step(input_tensor):
+        batch = next(data_loader)
+        batch["hidden_states"] = input_tensors.to(device) if input_tensor is not None else input_tensor
+        output_tensor = model.forward(input_ids=batch["input_ids"].to(device), position_ids=batch["position_ids"].to(device), hidden_states=batch["hidden_states"])
+
+        if pgm.process_group_manager.pp_is_last_stage:
+            output_tensor = F.cross_entropy(output.transpose(1,2), batch["target_ids"].to(device), reduction='mean')
+            nonlocal logging_loss
+            logging_loss += output_tensor.item() / data_loader.grad_acc_steps
+        return output_tensor
+
+    # 预热阶段：第一个micro-batch走过所有layer
+    for _ in range(num_warmup_microbatches):
+        input_tensor = pipeline_communication(operarion='recv_forward', shapes=tensor_shapes, device=device,dtype=dtype)
+        output_tensor = _forward_step(input_tensor)
+        pipeline_communication(operarion='send_forward', tensor=output_tensor, device=device, dtype=dtype)
+        input_tensors.appen(input_tensor)
+        output_tensors.append(output_tensor)
+
+    if num_microbatches_remaining > 0:
+        input_tensor = pipeline_communication(operarion='recv_forward', shapes=tensor_shapes, device=device, dtype=dtype)
+
+    if required_grad_sync:
+        model.require_backward_grad_sync = False
+
+    # 稳态: 进程交替执行前向和后向
+    for ith_microbatch in range(num_microbatches_remaining):
+        is_last_iteration = (ith_microbatch == num_microbatches_remaining - 1)
+        output_tensor = _forward_step(input_tensor)
+        output_tensor_grad = bidirectional_pipeline_communicate(operation='send_fwd_recv_bwd', send_tensor = output_tensor, recv_shaps=tensor_shapes, device=device, dtype=dtype)
+        input_tensors.append(input_tensor)
+        output_tensors.append(output_tensor)
+        input_tensor, output_tensor = input_tensors.pop(0), output_tensors.pop(0)
+
+        if num_warmup_microbatches == 0 and is_last_iteration:
+            model.require_backward_grad_sync = True
+
+        input_tensor_grad = model.backward(intput_tensor, output_tensor, output_tensor_grad)
+
+        if is_last_iteration:
+            intput_tensor = None
+            pipeline_communication(operarion='send_backward', tensor=input_tensor_grad, device=device, dtype=dtype)
+        else:
+            input_tensor = bidirectional_pipeline_communication(operation='send_bwd_recv_fwd', send_tensor=input_tensor_grad, recv_shapes=tensor_shapes, device=device, dtype=dtype)
+
+    # 冷静：所有前向完成，结束剩余的后向计算
+    for ith_warmup_microbatches in range(num_warmup_microbatches):
+        if required_grad_sync:
+            is_last_iteration = (ith_warmup_microbatches == num_warmup_microbatches - 1)
+            model.require_backward_grad_sync = (ith_warmup_microbatches == num_warmup_microbatches -1)
+
+        input_tensor, output_tensor = input_tensors.pop(0), output_tensors.pop(0)
+        output_tensor_grad = pipeline_communication(operarion='recv_backward', shapes=tensor_shapes, device=device, dtype=dtype)
         input_tensor_grad = model.backward(input_tensor, output_tensor, output_tensor_grad)
         pipeline_communication(operarion='send_backward', tensor=input_tensor_grad, device=device, dtype=dtype)
 
