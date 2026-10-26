@@ -22,7 +22,18 @@ from model_code.utils import set_all_seed, print, to_readable_format
 from model_code.dataloader import MicroBatchDataLoader
 from model_code.parallel.tensor_parallel import apply_tensor_parallel
 from model_code.parallel.data_parallel import DataParallelBucket
+from model_code.parallel.pipeline_parallel import PipelineParallel, train_step_pipeline_afab
 
+# 对PP最后一层的DP通信组，组内作梯度平均
+def all_reduce_loss_across_dp_ranks(loss, device):
+    reduced_loss = torch.tensor([loss if loss is not None else 0.0], dtype=torch.float32, device=device)
+
+    if pgm.process_group_manager.pp_is_last_stage:
+        dist.all_reduce(reduced_loss, op=dist.ReduceOp.AVG, group=pgm.process_group_manager.dp_group)
+
+    return reduced_loss.item()
+
+# 非PP的梯度累积
 def train_step(model, dataloader, device):
     acc_loss = 0.0
 
@@ -150,6 +161,9 @@ if __name__ == "__main__":
     if pgm.process_group_manager.tp_world_size > 1:
         model = apply_tensor_parallel(model)
 
+    if pgm.process_group_manager.pp_world_size > 1:
+        model = PipelineParallel(model, model_config)
+
     model.to(dtype).to(device)
 
     if pgm.process_group_manager.dp_world_size > 1:
@@ -180,14 +194,25 @@ if __name__ == "__main__":
  
     trained_token, step = 0, 0
 
+    tensor_shapes = (dataloader.micro_batch_size, dataloader.seq_len, model_config.hidden_size)
+
     dist.barrier()
 
     while trained_token<args.max_tokens:
         step_start_time = time.time()
         optimizer.zero_grad()
 
-        loss = train_step(model, dataloader, device)
+        if pgm.process_group_manager.pp_world_size > 1:
+            if args.pp_engine = "afab":
+                loss = train_step_pipeline_afab(model, dataloader, tensor_shapes, device, dtype)
+            else:
+                raise ValueError(f"Invalid pipeline, parallel, engine: {args.pp_engine}")
 
+        else:
+            loss = train_step(model, dataloader, device)
+
+        loss = all_reduce_loss_across_dp_ranks(loss, device)
+        
         optimizer.step()
 
         step_duration = time.time() - step_start_time
